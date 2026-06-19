@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include <WiFiManager.h>
 #include <ArduinoJson.h>
+#include <time.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 
@@ -22,10 +23,9 @@ static bool shouldSavePortalConfig = false;
 
 struct AppConfig
 {
-    String telemetryUrl;
-    String bearerToken;
-    String deviceId;
-    String deviceLocation;
+    String ingestUrl;
+    String deviceKey;
+    String deviceToken;
 };
 
 static AppConfig appConfig;
@@ -42,36 +42,21 @@ static float roundTo2(float value)
     return roundf(value * 100.0F) / 100.0F;
 }
 
-static String makeDefaultDeviceId()
-{
-    String mac = WiFi.macAddress();
-    mac.replace(":", "");
-    mac.toLowerCase();
-    return String(DEVICE_ID_PREFIX) + "-" + mac;
-}
-
 static void loadAppConfig()
 {
     preferences.begin("telemetry", true);
-    appConfig.telemetryUrl = preferences.getString("url", DEFAULT_TELEMETRY_CORE_URL);
-    appConfig.bearerToken = preferences.getString("token", DEFAULT_TELEMETRY_BEARER_TOKEN);
-    appConfig.deviceLocation = preferences.getString("location", DEFAULT_DEVICE_LOCATION);
-    appConfig.deviceId = preferences.getString("device_id", "");
+    appConfig.ingestUrl = preferences.getString("url", DEFAULT_TELEMETRY_INGEST_URL);
+    appConfig.deviceKey = preferences.getString("dev_key", DEFAULT_DEVICE_KEY);
+    appConfig.deviceToken = preferences.getString("dev_token", DEFAULT_DEVICE_TOKEN);
     preferences.end();
-
-    if (appConfig.deviceId.length() == 0)
-    {
-        appConfig.deviceId = makeDefaultDeviceId();
-    }
 }
 
 static void saveAppConfig()
 {
     preferences.begin("telemetry", false);
-    preferences.putString("url", appConfig.telemetryUrl);
-    preferences.putString("token", appConfig.bearerToken);
-    preferences.putString("device_id", appConfig.deviceId);
-    preferences.putString("location", appConfig.deviceLocation);
+    preferences.putString("url", appConfig.ingestUrl);
+    preferences.putString("dev_key", appConfig.deviceKey);
+    preferences.putString("dev_token", appConfig.deviceToken);
     preferences.end();
 }
 
@@ -83,27 +68,23 @@ static void markPortalConfigChanged()
 static void startConfigPortal(bool resetWifi)
 {
     char url[160];
-    char token[96];
-    char deviceId[64];
-    char location[64];
+    char deviceKey[64];
+    char deviceToken[128];
 
-    strlcpy(url, appConfig.telemetryUrl.c_str(), sizeof(url));
-    strlcpy(token, appConfig.bearerToken.c_str(), sizeof(token));
-    strlcpy(deviceId, appConfig.deviceId.c_str(), sizeof(deviceId));
-    strlcpy(location, appConfig.deviceLocation.c_str(), sizeof(location));
+    strlcpy(url, appConfig.ingestUrl.c_str(), sizeof(url));
+    strlcpy(deviceKey, appConfig.deviceKey.c_str(), sizeof(deviceKey));
+    strlcpy(deviceToken, appConfig.deviceToken.c_str(), sizeof(deviceToken));
 
-    WiFiManagerParameter telemetryUrlParam("url", "telemetry-core URL", url, sizeof(url));
-    WiFiManagerParameter tokenParam("token", "Bearer token (optional)", token, sizeof(token));
-    WiFiManagerParameter deviceIdParam("device_id", "Device ID", deviceId, sizeof(deviceId));
-    WiFiManagerParameter locationParam("location", "Location", location, sizeof(location));
+    WiFiManagerParameter ingestUrlParam("url", "telemetry-core ingest URL", url, sizeof(url));
+    WiFiManagerParameter deviceKeyParam("device_key", "Device key", deviceKey, sizeof(deviceKey));
+    WiFiManagerParameter deviceTokenParam("device_token", "X-Device-Token", deviceToken, sizeof(deviceToken));
 
     WiFiManager wifiManager;
     wifiManager.setSaveConfigCallback(markPortalConfigChanged);
     wifiManager.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT_SECONDS);
-    wifiManager.addParameter(&telemetryUrlParam);
-    wifiManager.addParameter(&tokenParam);
-    wifiManager.addParameter(&deviceIdParam);
-    wifiManager.addParameter(&locationParam);
+    wifiManager.addParameter(&ingestUrlParam);
+    wifiManager.addParameter(&deviceKeyParam);
+    wifiManager.addParameter(&deviceTokenParam);
 
     if (resetWifi)
     {
@@ -125,10 +106,9 @@ static void startConfigPortal(bool resetWifi)
 
     if (shouldSavePortalConfig)
     {
-        appConfig.telemetryUrl = telemetryUrlParam.getValue();
-        appConfig.bearerToken = tokenParam.getValue();
-        appConfig.deviceId = deviceIdParam.getValue();
-        appConfig.deviceLocation = locationParam.getValue();
+        appConfig.ingestUrl = ingestUrlParam.getValue();
+        appConfig.deviceKey = deviceKeyParam.getValue();
+        appConfig.deviceToken = deviceTokenParam.getValue();
         saveAppConfig();
         shouldSavePortalConfig = false;
         Serial.println("Customer configuration saved");
@@ -218,19 +198,50 @@ static bool readMeasurement(Measurement &measurement)
     return true;
 }
 
+static time_t getUnixTimestamp()
+{
+    time_t now = time(nullptr);
+    if (now > 1700000000)
+    {
+        return now;
+    }
+
+    return 0;
+}
+
+static void syncTime()
+{
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+    const unsigned long startedAt = millis();
+    while (getUnixTimestamp() == 0 && millis() - startedAt < NTP_SYNC_TIMEOUT_MS)
+    {
+        delay(250);
+    }
+
+    const time_t now = getUnixTimestamp();
+    if (now > 0)
+    {
+        Serial.print("NTP time synced: ");
+        Serial.println(static_cast<unsigned long>(now));
+    }
+    else
+    {
+        Serial.println("NTP sync timeout");
+    }
+}
+
 static String buildPayload(const Measurement &measurement)
 {
     JsonDocument doc;
 
-    doc["device_id"] = appConfig.deviceId;
-    doc["location"] = appConfig.deviceLocation;
-    doc["sensor"] = "bme280";
-    doc["bme280_address"] = bmeAddress;
-    doc["temperature_celsius"] = roundTo2(measurement.temperatureC);
-    doc["humidity_pct"] = roundTo2(measurement.humidityPct);
-    doc["pressure_hpa"] = roundTo2(measurement.pressureHpa);
-    doc["wifi_rssi_dbm"] = WiFi.RSSI();
-    doc["uptime_ms"] = millis();
+    doc["device_key"] = appConfig.deviceKey;
+    doc["timestamp"] = static_cast<unsigned long>(getUnixTimestamp());
+
+    JsonObject data = doc["data"].to<JsonObject>();
+    data["temperature"] = roundTo2(measurement.temperatureC);
+    data["pressure"] = roundTo2(measurement.pressureHpa);
+    data["humidity"] = roundTo2(measurement.humidityPct);
 
     String payload;
     serializeJson(doc, payload);
@@ -253,22 +264,17 @@ static bool postTelemetry(const String &payload)
     HTTPClient http;
     http.setTimeout(HTTP_TIMEOUT_MS);
 
-    if (!http.begin(appConfig.telemetryUrl))
+    if (!http.begin(appConfig.ingestUrl))
     {
         Serial.println("HTTP begin failed");
         return false;
     }
 
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-Device-Id", appConfig.deviceId);
-
-    if (appConfig.bearerToken.length() > 0)
-    {
-        http.addHeader("Authorization", String("Bearer ") + appConfig.bearerToken);
-    }
+    http.addHeader("X-Device-Token", appConfig.deviceToken);
 
     Serial.print("POST ");
-    Serial.println(appConfig.telemetryUrl);
+    Serial.println(appConfig.ingestUrl);
     Serial.print("Payload: ");
     Serial.println(payload);
 
@@ -323,6 +329,10 @@ void setup()
     loadAppConfig();
     sensorReady = initBme280();
     connectWiFi();
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        syncTime();
+    }
     lastPostAt = millis() - POST_INTERVAL_MS;
 }
 
@@ -345,6 +355,16 @@ void loop()
     }
 
     const String payload = buildPayload(measurement);
+    if (getUnixTimestamp() == 0)
+    {
+        Serial.println("Skipping POST: timestamp is not synced");
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            syncTime();
+        }
+        return;
+    }
+
     const bool ok = postTelemetry(payload);
 
     Serial.println(ok ? "Telemetry sent" : "Telemetry send failed");
