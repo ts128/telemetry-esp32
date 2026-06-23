@@ -2,7 +2,7 @@
 
 // Default values shown in the customer setup portal.
 // Wi-Fi SSID and password are entered in the portal and stored by WiFiManager.
-static constexpr const char *DEFAULT_TELEMETRY_INGEST_URL = "http://192.168.1.50:8080/api/v1/telemetry";
+static constexpr const char *DEFAULT_TELEMETRY_INGEST_URL = "https://telemetry-core.pl/api/v1/telemetry";
 static constexpr const char *DEFAULT_DEVICE_KEY = "esp32-bme280-001";
 static constexpr const char *DEFAULT_DEVICE_TOKEN = "";
 
