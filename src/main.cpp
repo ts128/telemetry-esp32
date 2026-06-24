@@ -20,6 +20,7 @@ static uint8_t bmeAddress = 0;
 static unsigned long lastPostAt = 0;
 static unsigned long configButtonPressedAt = 0;
 static bool shouldSavePortalConfig = false;
+static bool telemetryBlockedByConfiguration = false;
 
 struct AppConfig
 {
@@ -111,6 +112,7 @@ static void startConfigPortal(bool resetWifi)
         appConfig.deviceToken = deviceTokenParam.getValue();
         saveAppConfig();
         shouldSavePortalConfig = false;
+        telemetryBlockedByConfiguration = false;
         Serial.println("Customer configuration saved");
     }
 }
@@ -248,7 +250,13 @@ static String buildPayload(const Measurement &measurement)
     return payload;
 }
 
-static bool postTelemetry(const String &payload)
+struct HttpResponse
+{
+    int status;
+    String body;
+};
+
+static HttpResponse sendTelemetryRequest(const String &payload)
 {
     if (WiFi.status() != WL_CONNECTED)
     {
@@ -258,7 +266,7 @@ static bool postTelemetry(const String &payload)
     if (WiFi.status() != WL_CONNECTED)
     {
         Serial.println("Skipping POST: Wi-Fi is offline");
-        return false;
+        return {HTTPC_ERROR_CONNECTION_REFUSED, ""};
     }
 
     HTTPClient http;
@@ -267,10 +275,11 @@ static bool postTelemetry(const String &payload)
     if (!http.begin(appConfig.ingestUrl))
     {
         Serial.println("HTTP begin failed");
-        return false;
+        return {HTTPC_ERROR_CONNECTION_REFUSED, ""};
     }
 
     http.addHeader("Content-Type", "application/json");
+    http.addHeader("Accept", "application/json");
     http.addHeader("X-Device-Token", appConfig.deviceToken);
 
     Serial.print("POST ");
@@ -291,7 +300,60 @@ static bool postTelemetry(const String &payload)
         Serial.println(response);
     }
 
-    return status >= 200 && status < 300;
+    return {status, response};
+}
+
+static void logIngestMeta(const String &response)
+{
+    JsonDocument doc;
+    if (deserializeJson(doc, response) != DeserializationError::Ok)
+    {
+        return;
+    }
+
+    Serial.print("Ingested records: ");
+    Serial.println(doc["meta"]["ingested_records"] | 0);
+    Serial.print("Skipped records: ");
+    Serial.println(doc["meta"]["skipped_records"] | 0);
+}
+
+static bool postTelemetry(const String &payload)
+{
+    const unsigned long retryDelays[] = {0, FIRST_RETRY_DELAY_MS, SECOND_RETRY_DELAY_MS};
+
+    for (uint8_t attempt = 0; attempt < HTTP_MAX_ATTEMPTS; ++attempt)
+    {
+        if (retryDelays[attempt] > 0)
+        {
+            Serial.print("Retrying in ms: ");
+            Serial.println(retryDelays[attempt]);
+            delay(retryDelays[attempt]);
+        }
+
+        const HttpResponse response = sendTelemetryRequest(payload);
+        if (response.status >= 200 && response.status < 300)
+        {
+            logIngestMeta(response.body);
+            return true;
+        }
+
+        if (response.status == 401 || response.status == 404)
+        {
+            telemetryBlockedByConfiguration = true;
+            Serial.println("Telemetry disabled: check device key and token in the setup portal");
+            return false;
+        }
+
+        const bool retryable = response.status < 0 || response.status == 429 || response.status >= 500;
+        if (!retryable)
+        {
+            Serial.println("Request rejected. It will not be retried in this cycle.");
+            return false;
+        }
+    }
+
+    Serial.println("Telemetry retries exhausted");
+    return false;
 }
 
 static void handleConfigButton()
@@ -347,6 +409,12 @@ void loop()
     }
 
     lastPostAt = millis();
+
+    if (telemetryBlockedByConfiguration)
+    {
+        Serial.println("Telemetry is blocked until device configuration is updated");
+        return;
+    }
 
     Measurement measurement{};
     if (!readMeasurement(measurement))

@@ -23,3 +23,6 @@ static constexpr unsigned long POST_INTERVAL_MS = 60000;
 static constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
 static constexpr unsigned long HTTP_TIMEOUT_MS = 8000;
 static constexpr unsigned long NTP_SYNC_TIMEOUT_MS = 15000;
+static constexpr unsigned long FIRST_RETRY_DELAY_MS = 5000;
+static constexpr unsigned long SECOND_RETRY_DELAY_MS = 15000;
+static constexpr uint8_t HTTP_MAX_ATTEMPTS = 3;
